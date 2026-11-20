@@ -70,7 +70,7 @@ def sigmoid_pct(x):
 
 
 def round4(x):
-    """Half-up to 4 decimals; a whole number comes back as an int (like the starter)."""
+    """Half-up to 4 decimals; a whole number comes back as an int (matches the starter kit's output format)."""
     scaled = x * 10000
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
@@ -255,8 +255,8 @@ def growth_rows(case, reads, snaps, T_h):
             m = b_i - d_exp
             se_m = math.hypot(se_b, se_d)
             if f_p is not None:
-                # A last snapshot far off the fitted level means the slope is
-                # suspect: forecast flat from the anchor instead.
+                # If the anchor snapshot sits far off the fitted level curve, the
+                # fitted slope is suspect: forecast flat from the anchor instead.
                 arg = clamp((a_i - c_p) + (b_i - d_exp) * math.log(t_a_eff), -12.0, 5.0)
                 y_fit_a = 100.0 * math.exp(arg)
                 if abs(logit_clamped(r_last) - logit_clamped(clamp(y_fit_a, 0.005, 100.0))) > 0.75:
