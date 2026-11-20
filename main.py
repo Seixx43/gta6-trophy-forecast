@@ -1,29 +1,36 @@
-"""gta6-trophy-rarity-forecast-01 entry: growth-curve forecaster (Python 3.13, stdlib only).
+"""gta6-trophy-rarity-forecast-01 entry: round-2 growth + refresh-mixture forecaster.
+
+Python 3.13 stdlib only; deterministic (no randomness, byte-identical reruns);
+runs in about a second per case, inside the 8s budget.
 
 Reads every <id>.in in $MAKEFUN_INPUT_DIR (else /input) and writes <id>.out to
 $MAKEFUN_OUTPUT_DIR (else /output): {"trophies": [{"id": n, "q": [q05..q95]}...]}.
 
-The data-generating process this models:
-  - Exophase's page is stale between its own periodic refreshes. A read shows
-    earned_i / players_tracked as of the last refresh before it, so a refresh
-    moves every rate down at once (the tracked count jumps) except a 100% one.
-  - Earned counts grow in time since release like a saturating curve; over week
-    one a power law fits them well: e_i ~ a_i t^b_i and P ~ c t^d, so each
-    rate follows rate_i ~ A_i t^(b_i - d).
-  - Median: anchored on the last refresh snapshot's rate, extrapolated by the
-    fitted log-rate slope m_i = b_i - d over ln(t_eff / t_anchor), where the
-    target is pulled back by half the observed refresh cadence (the answering
-    read shows the page as of Exophase's last refresh before it).
-  - Spread (logit scale, analytic - no randomness, byte-identical reruns):
-    slope-extrapolation error (fit se plus a model-misspecification term),
-    per-refresh shock noise seen in the window, small-earned-count noise, and
-    snapshot staleness; floored and capped.
-  - No refresh visible in the whole window (the launch-night shape of the
-    practice cases): the forecast is a launch-night prior instead - a refresh
-    lands before the target with the tracked count jumping ~6x (638 -> 3,868
-    observed) while earned counts grow less. Per trophy y/r_last is
-    lognormal(ln -1.25, sigma) truncated to [-1.90, 0.10] (earned counts are
-    cumulative, and the refresh moves rates down); 100% stays 100%.
+The data process this models:
+  - Exophase's page is stale between its own refreshes: a read shows earned_i /
+    players_tracked as of the last refresh before it. At a refresh the tracked
+    count jumps (638 -> 3,868 on launch night) and the earned counts grow with
+    it - the newly tracked players' trophies arrive with them - so the rates
+    fell to ~0.28x, not the 0.165x a frozen-earned refresh would give (that
+    factor is recovered from the round-1 and house practice scores).
+  - Earned counts are recoverable almost exactly: rates print to 2 decimals, so
+    the count is the integer consistent with round(100 e / P, 2) == rate; the
+    recovered per-state rates (not the printed ones) feed every fit.
+  - Growth regime (several page states visible): with u = P_first / P(t) a rate
+    follows r = theta + (h - theta) * u (the early hardcore cohort h decaying
+    toward the population rate theta as tracked players accumulate) or a power
+    law in u; both are fit per trophy by median-of-slopes and picked - or
+    hedged 50/50 on thin data - by robust L1. The tracked count gets its own
+    saturating-vs-power fit on the increments above its first value. The answer
+    read shows the state as of the last refresh before the target, so the
+    forecast mixes over the state's age under a Gamma-Poisson refresh hazard
+    fit to the observed gaps (Lomax predictive: heavy-tailed when the evidence
+    is thin, with a no-refresh atom at the full horizon).
+  - Launch regime (one page state visible): a refresh lands before the target
+    per the observed ~4.5h launch-night sync cadence (a small no-refresh atom);
+    its tracked jump is J ~ 6.1x (scaled up if the state is already stale) and
+    the rate crosses it as J^(gamma-1) with gamma ~ 0.30 and a per-trophy
+    residual. 100% stays 100; earned-zero trophies stay ~0.
 """
 
 import json
@@ -31,26 +38,38 @@ import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from statistics import NormalDist, median
+from statistics import median
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
-Z = tuple(NormalDist().inv_cdf(t) for t in LEVELS)
 
-# Launch-night prior: ln(y / r_last) while no refresh is visible in the window.
-LN_MU, LN_SIGMA, LN_LO, LN_HI = -1.25, 0.57, -1.90, 0.10
+# Spread floors/caps on the logit scale.
+S_MIN, S_MAX = 0.08, 2.4
+K_G = 0.16            # rate-curve misspecification per ln-unit of u-extrapolation
+K_P = 0.34            # tracked-count curve misspecification per ln(t) beyond its fit
+SE_FLOOR = 0.10       # floor on any fit's residual sd
 
-# Growth-curve regime constants.
-KAPPA = 0.18            # log-rate slope model error per ln(t) unit (mis-specification)
-S_MIN, S_MAX = 0.12, 2.0
-GAP_LN_MAX = 4.0        # cap on ln(t_eff / t_anchor) fed into the spread
-D_PRIOR, SE_D_PRIOR = 0.6, 0.35   # players-tracked exponent when too few snapshots
-SE_M_NODATA = 0.35                # slope se when a trophy has too few usable points
-T_MIN_FIT = 0.25        # hours since release a snapshot needs to enter a fit
-E_MIN_FIT = 0.75        # earned-count floor for a usable earned-space fit point
-MAX_CADENCE_H = 48.0
+# Refresh hazard prior: Gamma(A0 events, B0 hours) behind the observed gaps.
+LAMBDA_A0, LAMBDA_B0 = 1.5, 7.0
+
+# Launch-night regime: the page's first catch-up sync landed ~4.5h after the
+# page's birth and jumped the tracked count 638 -> 3,868 = 6.06x; the earned
+# counts grew with it, so a rate crosses a jump as J^(gamma-1) with gamma
+# ~ 0.30 (rates fell to ~0.28x, recovered from the practice scores).
+CADENCE_H, CADENCE_SIG = 4.5, 0.45
+LN_J_MU = math.log(6.0627)
+LN_J_SIG = 0.25
+J_OVERDUE = 0.35
+GAMMA_MU, GAMMA_SD = 0.30, 0.10
+EPS_SD = 0.22
+W_NO_MAX, W_NO_OLD_CAP = 0.15, 0.60
+AGE_YOUNG_H = 10.0
+
+AGE_BINS = 26
+BISECT_ITERS = 42
+T_MIN_FIT = 0.10      # hours since release a state needs to enter the players fit
 
 
 def clamp(x, lo, hi):
@@ -89,47 +108,223 @@ def parse_dt(s):
     return dt.astimezone(timezone.utc)
 
 
-def loglog_fit(pts):
-    """Trimmed least squares of ln y on ln t.
+def norm_cdf(z):
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
-    Returns (intercept, slope, se_slope, resid_sd, resid_sd_recent) or None,
-    where resid_sd_recent uses the last few residuals (recent refresh shocks
-    are the ones like the future's).
+
+def earned_from_rate(rate, players):
+    """Earned count consistent with the 2-decimal print: the integer e with
+    round(100 e / players, 2) == rate; the float midpoint when none fits."""
+    x = rate * players / 100.0
+    lo = (rate - 0.005) * players / 100.0
+    hi = (rate + 0.005) * players / 100.0
+    base = math.floor(x)
+    for cand in (base, base + 1, base - 1):
+        if cand >= 0 and lo - 1e-9 <= cand <= hi + 1e-9:
+            return float(cand)
+    return x
+
+
+def theil_sen(xs, ys, sd_floor=None):
+    """Median-of-slopes robust line y = a + b x -> (a, b, sd_res, se_b) or None.
+
+    Two points determine the line exactly; the returned spread terms then stay
+    small and the curve-form risk is carried by the extrapolation terms.
+    sd_floor bounds the residual sd: absolute for ln-space fits, relative (a
+    fraction of the typical y) for fits on the rate itself.
     """
-    pts = [(t, y) for t, y in pts if t > 0 and y > 0 and math.isfinite(t) and math.isfinite(y)]
-    if len(pts) < 3:
+    if sd_floor is None:
+        sd_floor = SE_FLOOR
+    n = len(xs)
+    if n < 2:
         return None
-
-    def ls(ps):
-        n = len(ps)
-        xs = [math.log(t) for t, _ in ps]
-        ys = [math.log(y) for _, y in ps]
-        mx = sum(xs) / n
-        my = sum(ys) / n
-        sxx = sum((x - mx) ** 2 for x in xs)
-        if sxx <= 1e-12:
+    if n == 2:
+        if xs[1] == xs[0]:
             return None
-        slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
-        intercept = my - slope * mx
-        res = [y - (intercept + slope * x) for x, y in zip(xs, ys)]
-        var = sum(r * r for r in res) / (n - 2)
-        se = math.sqrt(var / sxx) if var > 0 else 0.0
-        return intercept, slope, se, math.sqrt(var), res
+        b = (ys[1] - ys[0]) / (xs[1] - xs[0])
+        return ys[0] - b * xs[0], b, 0.6 * sd_floor, 0.15 * abs(b) + 0.02
+    slopes = []
+    for i in range(n):
+        xi = xs[i]
+        yi = ys[i]
+        for j in range(i + 1, n):
+            dx = xs[j] - xi
+            if dx != 0.0:
+                slopes.append((ys[j] - yi) / dx)
+    if not slopes:
+        return None
+    b = median(slopes)
+    a = median([ys[k] - b * xs[k] for k in range(n)])
+    res = [ys[k] - (a + b * xs[k]) for k in range(n)]
+    mres = median(res)
+    sd = max(1.4826 * median([abs(r - mres) for r in res]), sd_floor)
+    mx = sum(xs) / n
+    sxx = math.sqrt(sum((x - mx) ** 2 for x in xs) / n)
+    se_b = sd / (sxx * math.sqrt(n)) if sxx > 1e-9 else 0.6 * abs(b) + 0.2
+    return a, b, sd, se_b
 
-    fit = ls(pts)
+
+class PowerCurve:
+    """ln y = a + b ln t; sigma grows with the distance outside the fit range."""
+
+    def __init__(self, a, b, sd, se_b, xbar, n, t_lo, t_hi):
+        self.a = a
+        self.b = b
+        self.sd = sd
+        self.se_b = se_b
+        self.xbar = xbar
+        self.n = n
+        self.t_lo = t_lo
+        self.t_hi = t_hi
+
+    def mu(self, t):
+        return self.a + self.b * math.log(max(t, 1e-3))
+
+    def sigma(self, t):
+        x = math.log(max(t, 1e-3))
+        dx_out = max(0.0, x - math.log(self.t_hi)) + max(0.0, math.log(self.t_lo) - x)
+        s2 = (self.sd ** 2) * (1.0 + 1.0 / self.n)
+        s2 += (self.se_b * (x - self.xbar)) ** 2
+        s2 += (K_P * dx_out) ** 2
+        return math.sqrt(max(s2, 1e-6))
+
+
+class WeibullCurve:
+    """ln y = ln A + ln(1 - exp(-(t/tc)^b)), robust L1 grid fit with refinement.
+
+    Keeps the near-best grid cells so the parameter spread feeds sigma(): the
+    asymptote the data cannot pin yet widens the extrapolation honestly.
+    """
+
+    def __init__(self, p, cells, sd, n, t_hi, l1):
+        self.p = p
+        self.cells = cells
+        self.sd = sd
+        self.n = n
+        self.t_hi = t_hi
+        self.l1 = l1
+
+    def _mu1(self, cell, t):
+        b, tc, lna = cell
+        u = (max(t, 1e-3) / tc) ** b
+        if u >= 40.0:
+            return lna
+        f = 1.0 - math.exp(-u)
+        return lna + math.log(f) if f > 1e-12 else lna - 28.0
+
+    def mu(self, t):
+        return self._mu1(self.p, t)
+
+    def sigma(self, t):
+        mus = [self._mu1(c, t) for c in self.cells]
+        spread = 0.5 * (max(mus) - min(mus)) if len(mus) > 1 else 0.0
+        dx_out = max(0.0, math.log(max(t, 1e-3) / self.t_hi))
+        s2 = (self.sd ** 2) * (1.0 + 1.0 / self.n)
+        s2 += spread ** 2
+        s2 += (K_P * dx_out) ** 2
+        return math.sqrt(max(s2, 1e-6))
+
+
+def _weibull_grid(ts, ys):
+    """L1 grid fit of the saturating form, two refinement rounds; None if degenerate."""
+    n = len(ts)
+    t_hi = max(ts)
+
+    def fit_at(b, tc):
+        lna_v = []
+        for t, y in zip(ts, ys):
+            u = (t / tc) ** b
+            f = 1.0 - math.exp(-u) if u < 40.0 else 1.0
+            if f <= 1e-12:
+                return None
+            lna_v.append(math.log(y) - math.log(f))
+        lna = median(lna_v)
+        l1 = 0.0
+        for t, y in zip(ts, ys):
+            u = (t / tc) ** b
+            f = 1.0 - math.exp(-u) if u < 40.0 else 1.0
+            l1 += abs(math.log(y) - (lna + (math.log(f) if f > 1e-12 else -28.0)))
+        return (b, tc, lna), l1 / n
+
+    cells = []
+    for i in range(13):
+        b = 0.25 * math.exp(math.log(3.0 / 0.25) * i / 12)
+        for j in range(13):
+            tc = t_hi * 0.2 * math.exp(math.log(100.0) * j / 12)
+            r = fit_at(b, tc)
+            if r is not None:
+                cells.append((r[1], r[0]))
+    if not cells:
+        return None
+    best_l1, best = min(cells)
+    for span_b, span_t in ((0.5, 1.6), (0.2, 0.8)):
+        finer = []
+        for i in range(7):
+            b = best[0] * math.exp(span_b * (i / 6.0 - 0.5))
+            for j in range(7):
+                tc = best[1] * math.exp(span_t * (j / 6.0 - 0.5))
+                r = fit_at(b, tc)
+                if r is not None:
+                    finer.append((r[1], r[0]))
+        if finer:
+            cells.extend(finer)
+            cand_l1, cand = min(finer)
+            if cand_l1 < best_l1:
+                best_l1, best = cand_l1, cand
+    pool = sorted((c for l1, c in cells if l1 <= best_l1 * 1.10 + 1e-9), key=lambda c: c[0] - c[1])
+    pool = pool[:12]
+    if best not in pool:
+        pool.append(best)
+    b, tc, lna = best
+    res = []
+    for t, y in zip(ts, ys):
+        u = (t / tc) ** b
+        f = 1.0 - math.exp(-u) if u < 40.0 else 1.0
+        res.append(math.log(y) - (lna + (math.log(f) if f > 1e-12 else -28.0)))
+    mres = median(res)
+    sd = max(1.4826 * median([abs(r - mres) for r in res]), SE_FLOOR)
+    return WeibullCurve(best, pool, sd, n, t_hi, best_l1)
+
+
+def fit_curve(ts, ys):
+    """Saturating-vs-power selection for a positive series; None when too thin."""
+    pts = [(t, y) for t, y in zip(ts, ys) if t > 0 and y > 0 and math.isfinite(t) and math.isfinite(y)]
+    if len(pts) < 2:
+        return None
+    xs = [math.log(t) for t, _ in pts]
+    ls = [math.log(y) for _, y in pts]
+    fit = theil_sen(xs, ls)
     if fit is None:
         return None
-    a, b, se_b, sd, res = fit
-    if len(pts) >= 6 and sd > 0:
-        kept = [p for p in pts if abs(math.log(p[1]) - (a + b * math.log(p[0]))) <= 2.5 * sd]
-        if 3 <= len(kept) < len(pts):
-            refit = ls(kept)
-            if refit is not None:
-                fit = refit
-    a, b, se_b, sd, res = fit
-    tail = res[-6:]
-    sd_recent = math.sqrt(sum(r * r for r in tail) / len(tail)) if len(tail) >= 3 else sd
-    return a, b, se_b, sd, sd_recent
+    a, b, sd, se_b = fit
+    n = len(pts)
+    xbar = sum(xs) / n
+    l1_pow = sum(abs(ls[k] - (a + b * xs[k])) for k in range(n)) / n
+    power = PowerCurve(a, b, sd, se_b, xbar, n, min(t for t, _ in pts), max(t for t, _ in pts))
+    if n >= 5:
+        w = _weibull_grid([t for t, _ in pts], [y for _, y in pts])
+        if w is not None and w.l1 < 0.93 * l1_pow - 0.005:
+            return w
+    return power
+
+
+def mixture_quantile(bins, tau):
+    """Quantile of a weighted normal mixture (weights normalized inside)."""
+    tot = sum(w for w, _, _ in bins)
+    if tot <= 0.0:
+        return None
+    lo = min(mu - 5.0 * sg for _, mu, sg in bins)
+    hi = max(mu + 5.0 * sg for _, mu, sg in bins)
+    for _ in range(BISECT_ITERS):
+        mid = 0.5 * (lo + hi)
+        cdf = 0.0
+        for w, mu, sg in bins:
+            cdf += w * norm_cdf((mid - mu) / sg)
+        if cdf < tau * tot:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
 
 
 def extract_snapshots(history, release):
@@ -165,128 +360,259 @@ def extract_snapshots(history, release):
     return reads, snaps
 
 
-def trophy_rates(reads, i):
-    """Every non-null rate the history shows for trophy i, oldest first."""
-    return [rs[i] for (_, _, rs) in reads if i < len(rs) and rs[i] is not None]
-
-
-def launch_night_rows(case, reads):
+def launch_rows(case, reads):
+    """One page state visible: refresh-timing and tracked-jump prior around it."""
+    release = parse_dt(case["game"]["release_date"] + "T00:00:00Z")
+    T_h = (parse_dt(case["target"]) - release).total_seconds() / 3600.0
+    birth = reads[0][0]
+    now = reads[-1][0]
+    a_state = max(now - birth, 0.1)   # the state's age is at least the observed span
+    H = max(T_h - now, 0.05)
+    if a_state <= AGE_YOUNG_H:
+        # The next sync's delay from the state's birth ~ LogN(CADENCE_H, CADENCE_SIG),
+        # conditioned on the silence the history already shows. The launch-night
+        # catch-up was observed to land ~4.5h after the page's birth, so while the
+        # state is young the refresh is treated as due; the no-refresh atom is capped.
+        s_now = 1.0 - norm_cdf(math.log(a_state / CADENCE_H) / CADENCE_SIG)
+        s_tgt = 1.0 - norm_cdf(math.log((a_state + H) / CADENCE_H) / CADENCE_SIG)
+        w_no = clamp(s_tgt / max(s_now, 1e-6), 0.03, W_NO_MAX)
+        ln_j = LN_J_MU
+    else:
+        # A state that has sat for a day or more is overdue: Pareto-type odds, and
+        # a bigger catch-up jump when the sync finally lands.
+        w_no = clamp((a_state / (a_state + H)) ** 1.2, 0.05, W_NO_OLD_CAP)
+        ln_j = LN_J_MU + J_OVERDUE * max(0.0, math.log((a_state + H) / CADENCE_H))
+    center = (GAMMA_MU - 1.0) * ln_j
+    sigma = math.sqrt(
+        (GAMMA_SD * ln_j) ** 2
+        + ((1.0 - GAMMA_MU) * LN_J_SIG) ** 2
+        + EPS_SD ** 2
+    )
     rows = []
     for i, tr in enumerate(case["trophies"]):
-        seen = trophy_rates(reads, i)
-        r = seen[-1] if seen else None
-        if r is None:
+        rate = None
+        for _t, _p, rs in reads:
+            if i < len(rs) and rs[i] is not None:
+                rate = rs[i]
+        if rate is None:
             rows.append({"id": tr["id"], "q": [0, 0, 0, 0, 0]})
             continue
-        if r >= 99.995:
-            rows.append({"id": tr["id"], "q": [99.9, 100, 100, 100, 100]})
+        if rate >= 99.995:
+            rows.append({"id": tr["id"], "q": [100, 100, 100, 100, 100]})
             continue
-        if r <= 0.004:
+        if rate <= 0.004:
             rows.append({"id": tr["id"], "q": [0, 0, 0, 0.01, 0.05]})
             continue
-        players = reads[-1][1] or 0
-        e_last = r * players / 100.0
-        # A tiny earned count makes the answering rate itself noisy (one person
-        # moves a 0.1% rate by a third), so widen the prior for those trophies.
-        s_count = clamp(1.0 / math.sqrt(max(e_last * 1.8, 0.5)), 0.0, 1.2)
-        nd = NormalDist(mu=LN_MU, sigma=math.sqrt(LN_SIGMA ** 2 + s_count ** 2))
-        lo_mass, hi_mass = nd.cdf(LN_LO), nd.cdf(LN_HI)
-        span = hi_mass - lo_mass
+        # The stale state is a point mass at the printed rate (the page is static
+        # between refreshes); the refreshed one moves the rate by J^(gamma-1) with
+        # a per-trophy residual, since the earned counts grow with the jump.
+        bins = [(w_no, 0.0, 1e-4), (1.0 - w_no, center, sigma)]
         q = []
         for tau in LEVELS:
-            u = clamp(lo_mass + tau * span, 1e-9, 1.0 - 1e-9)
-            lnrho = clamp(nd.inv_cdf(u), -3.5, 0.6)
-            q.append(round4(clamp(r * math.exp(lnrho), 0.005, 99.5)))
+            x = mixture_quantile(bins, tau)
+            q.append(round4(clamp(rate * math.exp(x), 0.0, 100.0)))
         rows.append({"id": tr["id"], "q": sorted(q)})
     return {"trophies": rows}
 
 
 def growth_rows(case, reads, snaps, T_h):
-    n_tr = len(case["trophies"])
+    """Several page states visible: fit the growth, mix over the state's age."""
+    p1 = None
+    for s in snaps:
+        if isinstance(s[2], (int, float)) and s[2] >= 1:
+            p1 = float(s[2])
+            break
+    t_last = snaps[-1][0]
+    p_last = (
+        snaps[-1][2]
+        if isinstance(snaps[-1][2], (int, float)) and snaps[-1][2] >= 1
+        else None
+    )
+    H = max(T_h - t_last, 0.05)
 
-    gaps = [snaps[j + 1][1] - snaps[j][1] for j in range(len(snaps) - 1)]
-    cadence = clamp(median(gaps), 0.5, MAX_CADENCE_H) if gaps else 4.0
+    gaps = [snaps[j + 1][0] - snaps[j][0] for j in range(len(snaps) - 1)]
+    gaps = [g for g in gaps if g > 0.0]
+    now_h = reads[-1][0]
 
-    p_pts = [
-        (s[0], s[2]) for s in snaps if s[0] >= T_MIN_FIT and isinstance(s[2], (int, float)) and s[2] >= 1
+    # Gamma-Poisson refresh hazard behind the observed gaps, integrated over its
+    # posterior: the state's age at the target has the Lomax survival
+    # S(a) = (s0 / (s0 + a))**m -- heavy-tailed while the evidence is thin -- and
+    # the no-refresh atom S(H) sits at the full horizon.
+    s0 = LAMBDA_B0 + sum(gaps) + max(now_h - t_last, 0.0)
+    m_exp = LAMBDA_A0 + len(gaps)
+
+    def surv(a):
+        return (s0 / (s0 + a)) ** m_exp
+
+    edges = [H * (k / AGE_BINS) ** 1.6 for k in range(AGE_BINS + 1)]
+    ages = []
+    for k in range(AGE_BINS):
+        w = surv(edges[k]) - surv(edges[k + 1])
+        if w > 1e-9:
+            ages.append((w, T_h - 0.5 * (edges[k] + edges[k + 1]), False))
+    w_atom = surv(H)
+    if w_atom > 1e-9:
+        ages.append((w_atom, t_last, True))
+
+    lnj_obs = None
+    if len(snaps) >= 2 and p_last is not None:
+        prev_p = snaps[-2][2]
+        if isinstance(prev_p, (int, float)) and prev_p >= 1 and p_last > prev_p:
+            lnj_obs = math.log(p_last / prev_p)
+
+    # Tracked-count forecast per age: increments above the first state get their
+    # own power-vs-Weibull fit; the stale age is observed, hence exact.
+    dp_pts = [
+        (t, p - p1)
+        for t, p in (
+            (s[0], s[2])
+            for s in snaps
+            if s[0] >= T_MIN_FIT and isinstance(s[2], (int, float)) and s[2] >= 1
+        )
+        if p1 is not None
     ]
-    f_p = loglog_fit(p_pts)
-    if f_p is not None:
-        c_p, d_exp, se_d = f_p[0], f_p[1], f_p[2]
-    else:
-        d_exp, se_d = D_PRIOR, SE_D_PRIOR
-
-    t_a, t_a_raw, p_a, _ = snaps[-1]
-    t_a_eff = max(t_a, 0.1)
-    t_eff = max(min(T_h - 0.5 * cadence, T_h), t_a_eff + 1e-6)
-    gap_ln = clamp(math.log(t_eff / t_a_eff), 0.0, GAP_LN_MAX)
-    k_future = clamp((T_h - t_a_raw) / cadence, 0.0, 3.0)
-    horizon_days = case["horizon_minutes"] / 1440.0
-    denom_t = max(T_h - 0.5 * cadence, 0.5 * T_h)
+    f_p = fit_curve([t for t, _ in dp_pts], [dp for _, dp in dp_pts])
+    age_u = []
+    for w_b, t_k, stale in ages:
+        if stale:
+            u_k = p1 / p_last if (p1 is not None and p_last) else None
+            age_u.append((w_b, u_k, 0.0, True))
+        elif f_p is not None and p1 is not None:
+            dp_k = math.exp(f_p.mu(t_k))
+            u_k = clamp(p1 / (p1 + dp_k), 1e-4, 1.0)
+            age_u.append((w_b, u_k, f_p.sigma(t_k), False))
+        elif lnj_obs is not None and p_last and p1 is not None:
+            u_k = clamp(p1 / (p_last * math.exp(lnj_obs)), 1e-4, 1.0)
+            age_u.append((w_b, u_k, 0.55, False))
+        else:
+            age_u.append((w_b, None, 0.0, False))
 
     rows = []
     for i, tr in enumerate(case["trophies"]):
-        seen = trophy_rates(reads, i)
-        r_last = seen[-1] if seen else None
-        if r_last is None:
+        r_print = None
+        for _ta, _tw, _pl, rates in snaps:
+            if i < len(rates) and rates[i] is not None:
+                r_print = rates[i]
+        if r_print is None:
             rows.append({"id": tr["id"], "q": [0, 0, 0, 0, 0]})
             continue
-        if r_last >= 99.995 and min(seen) >= 99.5:
-            rows.append({"id": tr["id"], "q": [99.9, 100, 100, 100, 100]})
+        if r_print >= 99.995:
+            rows.append({"id": tr["id"], "q": [100, 100, 100, 100, 100]})
             continue
-        if r_last <= 0.004:
+        if r_print <= 0.004:
             rows.append({"id": tr["id"], "q": [0, 0, 0, 0.01, 0.05]})
             continue
 
-        e_pts = []
-        r_pts = []
+        s_pts = []
         for t_attr, _t_raw, players, rates in snaps:
-            if t_attr < T_MIN_FIT or i >= len(rates) or rates[i] is None or not players:
+            if i >= len(rates) or rates[i] is None or not players or p1 is None:
                 continue
             rate = rates[i]
-            r_pts.append((t_attr, rate))
-            e = rate * players / 100.0
-            if e >= E_MIN_FIT:
-                e_pts.append((t_attr, e))
+            e = earned_from_rate(rate, players)
+            s_pts.append((p1 / players, 100.0 * e / players, e, rate))
+        e_l = s_pts[-1][2] if s_pts else 0.3
 
-        f_i = loglog_fit(e_pts)
-        if f_i is not None:
-            a_i, b_i, se_b, sd_i, sd_recent = f_i
-            m = b_i - d_exp
-            se_m = math.hypot(se_b, se_d)
-            if f_p is not None:
-                # If the anchor snapshot sits far off the fitted level curve, the
-                # fitted slope is suspect: forecast flat from the anchor instead.
-                arg = clamp((a_i - c_p) + (b_i - d_exp) * math.log(t_a_eff), -12.0, 5.0)
-                y_fit_a = 100.0 * math.exp(arg)
-                if abs(logit_clamped(r_last) - logit_clamped(clamp(y_fit_a, 0.005, 100.0))) > 0.75:
-                    m, se_m = 0.0, max(se_m, SE_M_NODATA)
-        else:
-            f_r = loglog_fit([(t, r) for t, r in r_pts if r >= 0.01])
-            if f_r is not None:
-                _a, m, se_m, _sd, sd_recent = f_r
-                sd_i = 0.05
+        pos = [sp for sp in s_pts if sp[1] > 0.004]
+        u_lo = u_hi = 0.0
+        lin = pw = None
+        if len(pos) >= 2:
+            u_lo = min(sp[0] for sp in pos)
+            u_hi = max(sp[0] for sp in pos)
+            lin = theil_sen(
+                [sp[0] for sp in pos],
+                [sp[1] for sp in pos],
+                0.03 * median([sp[1] for sp in pos]),
+            )
+            if u_hi - u_lo > 0.02 and u_lo > 0.0:
+                pw = theil_sen(
+                    [math.log(sp[0]) for sp in pos],
+                    [math.log(sp[1]) for sp in pos],
+                )
+
+        a_l = b_l = sd_l = se_l = ubar_l = 0.0
+        l1_lin = None
+        if lin is not None:
+            a_l, b_l, sd_l, se_l = lin
+            ubar_l = sum(sp[0] for sp in pos) / len(pos)
+            l1_lin = sum(abs(sp[1] - (a_l + b_l * sp[0])) for sp in pos) / len(pos)
+        a_w = b_w = sd_w = se_w = ubar_w = 0.0
+        l1_pw = None
+        if pw is not None:
+            a_w, b_w, sd_w, se_w = pw
+            ubar_w = sum(math.log(sp[0]) for sp in pos) / len(pos)
+            l1_pw = sum(
+                abs(math.log(sp[1]) - (a_w + b_w * math.log(sp[0]))) for sp in pos
+            ) / len(pos)
+
+        use_lin = use_pw = False
+        if lin is not None and pw is not None:
+            if len(pos) >= 4 and l1_pw < 0.85 * l1_lin - 0.005:
+                use_pw = True
+            elif len(pos) >= 4 and l1_lin < 0.85 * l1_pw - 0.005:
+                use_lin = True
             else:
-                m, se_m, sd_i, sd_recent = 0.0, SE_M_NODATA, 0.05, 0.05
-        m = clamp(m, -1.2, 1.2)
+                use_lin = use_pw = True   # thin or ambiguous data: hedge both forms
+        elif lin is not None:
+            use_lin = True
+        elif pw is not None:
+            use_pw = True
 
-        ratio = math.exp(clamp(m * gap_ln, -2.0, 2.0))
-        y_med = clamp(r_last * ratio, 0.005, 100.0)
+        w_div = 0.5 if (use_lin and use_pw) else 1.0
+        mbins = []
+        for w_b, u_k, s_dP, stale in age_u:
+            if u_k is None:
+                continue
+            if stale:
+                # The page is static between refreshes: no refresh by the answer
+                # read means the printed rates come back exactly.
+                mbins.append((w_b, logit_clamped(r_print), 1e-4))
+                continue
+            w_use = w_b * w_div
+            if w_use <= 1e-12:
+                continue
+            dx_out = math.log(u_lo / u_k) if u_k < u_lo else 0.0
+            s_extrap = K_G * dx_out
+            if use_lin:
+                r_k = max(a_l + b_l * u_k, 1e-4)
+                e_k = r_k * p1 / (100.0 * u_k)
+                s_r = math.sqrt(sd_l ** 2 + (se_l * (u_k - ubar_l)) ** 2)
+                s_ln = math.sqrt(
+                    (s_r / r_k) ** 2
+                    + (abs(b_l) * u_k * (1.0 - u_k) * s_dP / r_k) ** 2
+                    + 1.0 / max(e_k, 0.3)
+                    + s_extrap ** 2
+                )
+                m_logit = logit_clamped(clamp(r_k, 0.01, 99.99))
+                s_logit = clamp(s_ln * 100.0 / (100.0 - min(r_k, 99.9)), S_MIN, S_MAX)
+                mbins.append((w_use, m_logit, s_logit))
+            if use_pw:
+                r_k = math.exp(a_w + b_w * math.log(u_k))
+                if r_k <= 1e-4:
+                    r_k = 1e-4
+                e_k = r_k * p1 / (100.0 * u_k)
+                s_lnf = math.sqrt(sd_w ** 2 + (se_w * (math.log(u_k) - ubar_w)) ** 2)
+                s_ln = math.sqrt(
+                    s_lnf ** 2
+                    + (abs(b_w) * (1.0 - u_k) * s_dP) ** 2
+                    + 1.0 / max(e_k, 0.3)
+                    + s_extrap ** 2
+                )
+                m_logit = logit_clamped(clamp(r_k, 0.01, 99.99))
+                s_logit = clamp(s_ln * 100.0 / (100.0 - min(r_k, 99.9)), S_MIN, S_MAX)
+                mbins.append((w_use, m_logit, s_logit))
 
-        s_slope = gap_ln * math.sqrt(se_m ** 2 + KAPPA ** 2)
-        e_anchor = (r_last * p_a / 100.0) if p_a else 0.0
-        b_use = f_i[1] if f_i is not None else (d_exp if f_p is not None else D_PRIOR)
-        e_t = max(e_anchor * (t_eff / t_a_eff) ** b_use, 0.25) if e_anchor > 0 else 0.25
-        s_count = clamp(1.0 / math.sqrt(e_t), 0.0, 1.2)
-        s_shock = clamp(sd_recent, 0.01, 0.6) * math.sqrt(1.0 + k_future)
-        s_stale = abs(m) * abs(math.log(T_h / denom_t)) if T_h > 0 else 0.0
-        s = math.sqrt(s_slope ** 2 + s_count ** 2 + s_shock ** 2 + s_stale ** 2)
-        if len(e_pts) < 2:
-            s = max(s, 0.5 * math.sqrt(horizon_days))
-        s = clamp(s, S_MIN, S_MAX)
+        if not mbins:
+            s_ln = 0.4 + 1.0 / math.sqrt(max(e_l, 0.3))
+            mbins = [(
+                1.0,
+                logit_clamped(r_print),
+                clamp(s_ln * 100.0 / (100.0 - min(r_print, 99.9)), S_MIN, S_MAX),
+            )]
 
-        level = logit_clamped(y_med)
-        q = [round4(clamp(sigmoid_pct(level + z * s), 0.0, 100.0)) for z in Z]
+        q = []
+        for tau in LEVELS:
+            lv = mixture_quantile(mbins, tau)
+            q.append(round4(clamp(sigmoid_pct(lv), 0.0, 100.0)))
         rows.append({"id": tr["id"], "q": sorted(q)})
     return {"trophies": rows}
 
@@ -298,7 +624,7 @@ def forecast_case(case):
     release = parse_dt(case["game"]["release_date"] + "T00:00:00Z")
     reads, snaps = extract_snapshots(history, release)
     if len(snaps) <= 1:
-        return launch_night_rows(case, reads)
+        return launch_rows(case, reads)
     target_h = (parse_dt(case["target"]) - release).total_seconds() / 3600.0
     return growth_rows(case, reads, snaps, target_h)
 
