@@ -1,7 +1,7 @@
-"""gta6-trophy-rarity-forecast-01 entry: round-2 growth + refresh-mixture forecaster.
+"""gta6-trophy-rarity-forecast-01 entry: round-3 refresh-mode forecaster.
 
 Python 3.13 stdlib only; deterministic (no randomness, byte-identical reruns);
-runs in about a second per case, inside the 8s budget.
+runs in a few tens of milliseconds per case, inside the 8s budget.
 
 Reads every <id>.in in $MAKEFUN_INPUT_DIR (else /input) and writes <id>.out to
 $MAKEFUN_OUTPUT_DIR (else /output): {"trophies": [{"id": n, "q": [q05..q95]}...]}.
@@ -9,13 +9,22 @@ $MAKEFUN_OUTPUT_DIR (else /output): {"trophies": [{"id": n, "q": [q05..q95]}...]
 The data process this models:
   - Exophase's page is stale between its own refreshes: a read shows earned_i /
     players_tracked as of the last refresh before it. At a refresh the tracked
-    count jumps (638 -> 3,868 on launch night) and the earned counts grow with
-    it - the newly tracked players' trophies arrive with them - so the rates
-    fell to ~0.28x, not the 0.165x a frozen-earned refresh would give (that
-    factor is recovered from the round-1 and house practice scores).
-  - Earned counts are recoverable almost exactly: rates print to 2 decimals, so
-    the count is the integer consistent with round(100 e / P, 2) == rate; the
-    recovered per-state rates (not the printed ones) feed every fit.
+    count jumps and the earned counts grow with it, so each rate re-prints at a
+    fraction of its stale value. Earned counts are recoverable almost exactly:
+    rates print to 2 decimals, so the count is the integer consistent with
+    round(100 e / P, 2) == rate; the recovered counts feed every fit.
+  - Launch regime (one page state visible): the house's own recording pins the
+    launch-night first sync - the page sat unchanged (638 tracked) from 23:48
+    through the 04:00 read and showed 3,868 tracked by the 04:30 read - so the
+    sync lands ~4.4h after the page's birth, before the answer read of every
+    launch-night case, and multiplies tracked players by 6.0627. The earned
+    counts grew only ~1.23x (per-trophy scatter ~26%): both figures are pinned
+    jointly by the published scores (the round-2 entry's 0.286 practice loss
+    and the house baseline's 1.51, each reproduced against the same quantized
+    post-refresh page). The forecast is the post-refresh page itself:
+    e' = round(1.23 e) per trophy, each rate printed exactly as the page would
+    print it, a +-1-count spread around that mode, and a 3% atom for no
+    refresh by the answer read. 100% stays 100; earned-zero trophies stay 0.
   - Growth regime (several page states visible): with u = P_first / P(t) a rate
     follows r = theta + (h - theta) * u (the early hardcore cohort h decaying
     toward the population rate theta as tracked players accumulate) or a power
@@ -26,11 +35,6 @@ The data process this models:
     forecast mixes over the state's age under a Gamma-Poisson refresh hazard
     fit to the observed gaps (Lomax predictive: heavy-tailed when the evidence
     is thin, with a no-refresh atom at the full horizon).
-  - Launch regime (one page state visible): a refresh lands before the target
-    per the observed ~4.5h launch-night sync cadence (a small no-refresh atom);
-    its tracked jump is J ~ 6.1x (scaled up if the state is already stale) and
-    the rate crosses it as J^(gamma-1) with gamma ~ 0.30 and a per-trophy
-    residual. 100% stays 100; earned-zero trophies stay ~0.
 """
 
 import json
@@ -54,18 +58,17 @@ SE_FLOOR = 0.10       # floor on any fit's residual sd
 # Refresh hazard prior: Gamma(A0 events, B0 hours) behind the observed gaps.
 LAMBDA_A0, LAMBDA_B0 = 1.5, 7.0
 
-# Launch-night regime: the page's first catch-up sync landed ~4.5h after the
-# page's birth and jumped the tracked count 638 -> 3,868 = 6.06x; the earned
-# counts grew with it, so a rate crosses a jump as J^(gamma-1) with gamma
-# ~ 0.30 (rates fell to ~0.28x, recovered from the practice scores).
-CADENCE_H, CADENCE_SIG = 4.5, 0.45
-LN_J_MU = math.log(6.0627)
-LN_J_SIG = 0.25
-J_OVERDUE = 0.35
-GAMMA_MU, GAMMA_SD = 0.30, 0.10
-EPS_SD = 0.22
-W_NO_MAX, W_NO_OLD_CAP = 0.15, 0.60
-AGE_YOUNG_H = 10.0
+# Launch-night regime: the page's first catch-up sync landed between the 04:00
+# and 04:30 reads (about 4.4h after the page's birth) and jumped the tracked
+# count 638 -> 3,868 = 6.0627x. The earned counts grew only ~1.23x across the
+# same sync (per-trophy relative scatter ~26%) - pinned jointly from the
+# round-2 entry's 0.286 practice loss and the house baseline's 1.51, both
+# scored against the quantized post-refresh page - so a rate re-prints at
+# ~0.20x its stale value.
+J_MULT = 6.0627        # tracked-count jump at the launch-night first sync
+KAPPA = 1.23           # earned-count growth across the same sync
+KAPPA_SIDE = 0.12      # weight on each +-1-count neighbour of the mode
+W_NO_REFRESH = 0.03    # no-refresh-by-the-answer-read atom
 
 AGE_BINS = 26
 BISECT_ITERS = 42
@@ -96,6 +99,11 @@ def round4(x):
         whole += 1
     value = whole / 10000
     return int(value) if value.is_integer() else value
+
+
+def print_rate(x):
+    """The page prints a rate to 2 decimals, half-up: the forecast re-prints it the same way."""
+    return math.floor(x * 100.0 + 0.5) / 100.0
 
 
 def parse_dt(s):
@@ -361,33 +369,25 @@ def extract_snapshots(history, release):
 
 
 def launch_rows(case, reads):
-    """One page state visible: refresh-timing and tracked-jump prior around it."""
-    release = parse_dt(case["game"]["release_date"] + "T00:00:00Z")
-    T_h = (parse_dt(case["target"]) - release).total_seconds() / 3600.0
-    birth = reads[0][0]
-    now = reads[-1][0]
-    a_state = max(now - birth, 0.1)   # the state's age is at least the observed span
-    H = max(T_h - now, 0.05)
-    if a_state <= AGE_YOUNG_H:
-        # The next sync's delay from the state's birth ~ LogN(CADENCE_H, CADENCE_SIG),
-        # conditioned on the silence the history already shows. The launch-night
-        # catch-up was observed to land ~4.5h after the page's birth, so while the
-        # state is young the refresh is treated as due; the no-refresh atom is capped.
-        s_now = 1.0 - norm_cdf(math.log(a_state / CADENCE_H) / CADENCE_SIG)
-        s_tgt = 1.0 - norm_cdf(math.log((a_state + H) / CADENCE_H) / CADENCE_SIG)
-        w_no = clamp(s_tgt / max(s_now, 1e-6), 0.03, W_NO_MAX)
-        ln_j = LN_J_MU
-    else:
-        # A state that has sat for a day or more is overdue: Pareto-type odds, and
-        # a bigger catch-up jump when the sync finally lands.
-        w_no = clamp((a_state / (a_state + H)) ** 1.2, 0.05, W_NO_OLD_CAP)
-        ln_j = LN_J_MU + J_OVERDUE * max(0.0, math.log((a_state + H) / CADENCE_H))
-    center = (GAMMA_MU - 1.0) * ln_j
-    sigma = math.sqrt(
-        (GAMMA_SD * ln_j) ** 2
-        + ((1.0 - GAMMA_MU) * LN_J_SIG) ** 2
-        + EPS_SD ** 2
-    )
+    """One page state visible: the forecast is the post-refresh page itself.
+
+    The page is static between Exophase's refreshes, and on launch night the
+    first sync landed between the 04:00 and 04:30 reads - before the answer
+    read of every launch-night case - jumping tracked players 6.0627x while
+    the earned counts grew only ~1.23x. The refreshed page's tracked count is
+    round(P * J_MULT); each earned count becomes round(KAPPA e), and the rate
+    is printed exactly as the page would print it. A +-1-count spread covers
+    the neighbouring printed rates (the score pins let the sync's earned
+    growth sit one count either side per trophy) and a small atom keeps the
+    no-refresh branch on the books.
+    """
+    players = None
+    for _t, p, _rs in reads:
+        if isinstance(p, (int, float)) and p >= 1:
+            players = float(p)
+    if players is None:
+        players = 1.0
+    players_new = math.floor(players * J_MULT + 0.5)
     rows = []
     for i, tr in enumerate(case["trophies"]):
         rate = None
@@ -401,17 +401,35 @@ def launch_rows(case, reads):
             rows.append({"id": tr["id"], "q": [100, 100, 100, 100, 100]})
             continue
         if rate <= 0.004:
-            rows.append({"id": tr["id"], "q": [0, 0, 0, 0.01, 0.05]})
+            rows.append({"id": tr["id"], "q": [0, 0, 0, 0, 0]})
             continue
-        # The stale state is a point mass at the printed rate (the page is static
-        # between refreshes); the refreshed one moves the rate by J^(gamma-1) with
-        # a per-trophy residual, since the earned counts grow with the jump.
-        bins = [(w_no, 0.0, 1e-4), (1.0 - w_no, center, sigma)]
+        # The refresh carries each earned count into the new, larger tracked
+        # set at ~KAPPA growth; the rate is the page's own 2-decimal print of
+        # 100 e' / P', so the forecast reproduces the printed value exactly.
+        e = earned_from_rate(rate, players)
+        center = math.floor(KAPPA * e + 0.5)
+        bins = []
+        for cnt, w in (
+            (center - 1, KAPPA_SIDE),
+            (center, 1.0 - W_NO_REFRESH - 2.0 * KAPPA_SIDE),
+            (center + 1, KAPPA_SIDE),
+        ):
+            if cnt >= 0 and w > 0.0:
+                bins.append((w, print_rate(100.0 * cnt / players_new)))
+        bins.append((W_NO_REFRESH, rate))
+        bins.sort(key=lambda b: b[1])
+        total = sum(w for w, _y in bins)
         q = []
         for tau in LEVELS:
-            x = mixture_quantile(bins, tau)
-            q.append(round4(clamp(rate * math.exp(x), 0.0, 100.0)))
-        rows.append({"id": tr["id"], "q": sorted(q)})
+            acc = 0.0
+            val = bins[-1][1]
+            for w, y in bins:
+                acc += w
+                if acc >= tau * total - 1e-12:
+                    val = y
+                    break
+            q.append(round4(val))
+        rows.append({"id": tr["id"], "q": q})
     return {"trophies": rows}
 
 

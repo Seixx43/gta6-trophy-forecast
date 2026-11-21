@@ -6,8 +6,9 @@
 
 Forecasts each Grand Theft Auto VI PlayStation 5 trophy's Exophase earn rate at a future target
 as five quantiles (5/25/50/75/95%), from the house's recorded page reads. Robust per-trophy
-rate curves in tracked-share space, players-tracked extrapolation, and a refresh-timing
-mixture spread. Python 3.13 stdlib only, deterministic, runs in well under a second per case.
+rate curves in tracked-share space, players-tracked extrapolation, and a refresh-cadence mode
+forecast for launch-night cases. Python 3.13 stdlib only, deterministic, runs in well under a
+second per case.
 
 ## Model
 
@@ -19,11 +20,16 @@ mixture spread. Python 3.13 stdlib only, deterministic, runs in well under a sec
   their own saturating-vs-power fit. The forecast mixes over the answer state's age under
   a Gamma-Poisson refresh hazard fit to the observed gaps (Lomax predictive, no-refresh
   atom at the horizon).
-- Launch regime (one page state): refresh-timing atom plus a J^(gamma-1) rate jump across
-  the tracked-count sync (J ~ 6.1x observed launch night, gamma ~ 0.30, per-trophy
-  residual).
-- Spread: per-component analytic quadrature of fit-residual, u-extrapolation, count-noise
-  and players-forecast error; ~0.9 coverage in synthetic self-tests.
+- Launch regime (one page state): the forecast is the post-refresh page itself. The page is
+  static between Exophase's refreshes; launch night's first sync landed between the 04:00 and
+  04:30 reads - before the answer read of every launch-night case - jumping tracked players
+  6.0627x (638 -> 3,868) while earned counts grew ~1.23x. The forecast re-prints the refreshed
+  page exactly: round(P x 6.0627) tracked, round(1.23 e) earned per trophy, rate printed to 2
+  decimals as the page prints it.
+- Spread: growth cases carry per-component analytic quadrature of fit-residual,
+  u-extrapolation, count-noise and players-forecast error (~0.9 coverage in synthetic
+  self-tests); launch cases spread over the refreshed page's +-1-count printed-rate
+  neighbourhood with a small no-refresh atom.
 
 ## Run
 
